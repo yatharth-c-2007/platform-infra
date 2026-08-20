@@ -1,0 +1,8 @@
+---
+- name: Provision all Kubernetes nodes
+  hosts: k8s_cluster
+  become: true
+  vars:
+    kubernetes_version: "1.34"
+  roles:
+    - k8s-common
