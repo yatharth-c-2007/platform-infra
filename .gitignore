@@ -1,3 +1,6 @@
 .vagrant/
 vagrant-ssh-config
 terraform/kubeconfig
+terraform/.terraform/
+*.tfstate
+*.tfstate.*
