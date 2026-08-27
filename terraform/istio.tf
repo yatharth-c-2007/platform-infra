@@ -19,6 +19,10 @@ resource "helm_release" "istiod" {
 	namespace = "istio-system"
 	version = "1.30.0"
 	depends_on = [helm_release.istio_base]
+	set {
+		name = "pilot.resources.requests.memory"
+		value = "512Mi"
+	}
 }
 
 resource "helm_release" "istio_gateway" {
