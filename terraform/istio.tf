@@ -32,4 +32,9 @@ resource "helm_release" "istio_gateway" {
 	namespace = "istio-system"
 	version = "1.30.0"
 	depends_on = [helm_release.istiod]
+	timeout = 900
+	set {
+		name = "service.type"
+		value = "NodePort"
+	}
 }
