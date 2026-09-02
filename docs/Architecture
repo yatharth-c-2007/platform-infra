@@ -1,0 +1,107 @@
+# Architecture — Self-Hosted Internal Developer Platform
+
+## What this is
+
+A self-hosted Internal Developer Platform (IDP), built entirely on local infrastructure with zero cloud spend. It provides the layer platform teams normally build internally at real companies: push code, get it automatically built, scanned, deployed via GitOps, and observed — without anyone touching `kubectl apply` by hand.
+
+A small 4-service order-processing application (`api-gateway`, `order-service`, `inventory-service`, `notification-service`) runs on top of the platform as a realistic sample workload — it isn't the point of the project, it's what exercises every layer of it: real service-to-service traffic for the mesh to manage, real failure modes (out-of-stock, downstream timeouts) for observability to capture, and a real deployable artifact for the pipeline to move.
+
+Everything below runs on 3 local VMs on a single laptop. No AWS, no managed Kubernetes, no cloud load balancer — every constraint in this document (memory limits, LoadBalancer behavior, networking quirks) is a direct consequence of that choice, and is called out explicitly where it shaped a decision.
+
+## Design philosophy
+
+Two decisions run through the whole project:
+
+1. **T-shaped over generalist.** Rather than touching a dozen tools shallowly, one vertical — supply-chain security (image signing, SBOMs, admission control, metrics-gated rollouts) — goes deliberately deep, layered onto infrastructure that's already broad. A résumé line reading "used 12 tools" is weak; "built a platform with an enforced signing/admission chain" is specific and defensible.
+2. **Each tool has one job, not an overlapping one.** Three CI systems exist (GitHub Actions, Jenkins, GitLab CI) — they are deliberately *not* doing the same thing three times. See the CI/CD section below for the actual division of labor.
+
+## High-level architecture
+
+```
+                        ┌─────────────────────────────────────┐
+                        │         Developer laptop (host)       │
+                        │  Terraform · Ansible · Vagrant · kubectl│
+                        └──────────────────┬────────────────────┘
+                                           │ SSH / Kubernetes API
+        ┌──────────────────────────────────┼──────────────────────────────────┐
+        │                                  │                                  │
+ ┌──────▼──────┐                   ┌───────▼───────┐                  ┌───────▼───────┐
+ │ k8s-control-│                   │ k8s-worker-1  │                  │ k8s-worker-2  │
+ │   plane     │                   │               │                  │               │
+ │ (VirtualBox)│                   │ (VirtualBox)  │                  │ (VirtualBox)  │
+ └─────────────┘                   └───────────────┘                  └───────────────┘
+        Private network: 192.168.56.10 / .11 / .12 (Vagrant hostonly adapter)
+```
+
+Each VM is provisioned by Ansible (containerd, kubeadm/kubelet/kubectl), then joined into a real `kubeadm` cluster with Calico as the CNI. This is deliberately *not* Minikube — a single-node cluster makes several of the required tools (Ansible fleet management, cross-node networking, the service mesh) meaningless, since there's nothing to distribute across. Bare-metal `kubeadm` across real VMs is also how non-cloud production Kubernetes is actually bootstrapped at companies that can't or won't run on managed cloud Kubernetes.
+
+## Component inventory
+
+### Application layer
+
+| Service | Responsibility | Port |
+|---|---|---|
+| `api-gateway` | Only externally-reachable service; forwards to `order-service` | 5000 |
+| `order-service` | Creates orders; calls `inventory-service` then `notification-service` | 5003 |
+| `inventory-service` | Tracks stock, handles reservations (includes a deliberately out-of-stock SKU for failure-path testing) | 5001 |
+| `notification-service` | Best-effort notification dispatch; failure here does not fail the parent order | 5002 |
+
+Each service: Flask, its own `Dockerfile`, its own test suite, its own GitHub repo. Repo-per-service (rather than a monorepo) mirrors how real microservice organizations separate independent build/deploy lifecycles.
+
+### Infrastructure layer
+
+- **Vagrant + VirtualBox** — provisions the 3 VMs on a private hostonly network with static IPs.
+- **Ansible** — configures all 3 nodes identically from bare OS: disables swap, sets required sysctls (`ip_forward`, bridge-nf-call-iptables), installs containerd (with `SystemdCgroup = true`), installs and version-pins `kubeadm`/`kubelet`/`kubectl` via the official `pkgs.k8s.io` apt repo.
+- **Kubernetes (kubeadm)** — bootstrapped manually: `kubeadm init` on the control-plane with `--pod-network-cidr=10.244.0.0/16` (deliberately non-overlapping with the VMs' own `192.168.56.0/24` network), Calico installed via its operator, both workers joined via `kubeadm join`.
+
+### Platform layer (Terraform + Helm)
+
+- **Namespaces + RBAC** — `ecommerce`, `monitoring`, `argocd` namespaces; a least-privilege `ServiceAccount`/`Role`/`RoleBinding` scoped only to `ecommerce`, intended as the identity ArgoCD will eventually deploy under. Blast radius of a compromised deploy credential is one namespace, not the cluster.
+- **Istio** — installed as 3 separate Helm releases (`base`, `istiod`, `gateway`) with explicit `depends_on` ordering, since `istiod` requires `base`'s CRDs and `gateway` requires `istiod`'s control plane. Provides mTLS between services, traffic routing, and the eventual canary/metrics-gated rollout capability.
+- **Prometheus + Grafana + Alertmanager** (`kube-prometheus-stack`) and **Loki + Promtail** (`loki-stack`) — full metrics + logs observability, queried together from Grafana.
+- **ArgoCD** *(next)* — will own GitOps deployment of the 4 microservices from a separate `gitops-manifests` repo, watching it and auto-syncing. This is a deliberate split: Terraform owns platform infrastructure, ArgoCD owns application delivery — the same division real platform teams draw.
+
+### CI/CD (planned) — three tools, three distinct jobs
+
+| Tool | Job |
+|---|---|
+| GitHub Actions | Fast lint/unit test on every push/PR to each microservice repo |
+| Jenkins | Heavier pipeline: integration tests, image build, (later) signing, push to Artifactory |
+| GitLab CI | Independent pipeline validating/planning the `platform-infra` Terraform — a different concern entirely, not a duplicate app pipeline |
+
+### Security thread (planned)
+
+A narrow, deliberately deep addition on top of the existing pipeline, not a full DevSecOps buildout (no Vault, no policy-as-code at scale — that's explicitly deferred alongside cloud):
+
+1. **Cosign** — signs images as part of the Jenkins pipeline.
+2. **Syft + Grype** — generates an SBOM per image, scans it against known CVEs.
+3. **Kyverno** — cluster admission controller; refuses to schedule any pod running an unsigned image. This is what makes signing *enforced* rather than decorative.
+4. **Argo Rollouts** — canary deployments gated on live Prometheus metrics, with automatic rollback on regression.
+
+## Hardware constraints and how they shaped real decisions
+
+Running on a single laptop with ~6.9GB total RAM shared across 3 VMs (2GB control-plane, 1.5GB per worker) is below Kubernetes' own recommended per-node minimum, and this constraint surfaced directly in the build more than once:
+
+- **`istiod`'s default Helm chart requests 2048Mi** — larger than an entire worker's allocatable memory. Fixed by explicitly overriding `pilot.resources.requests.memory` to `512Mi` via a Helm `set` block, rather than accepting the chart's production-scale default.
+- **`kube-prometheus-stack` and Grafana ship with no explicit default memory request at all** in several components — meaning no lower bound, but also no upper guardrail. Addressed by setting deliberate, modest explicit requests rather than trusting an absent default.
+- **Istio's gateway Service defaults to `type: LoadBalancer`**, which never receives an `EXTERNAL-IP` on a bare-metal/local cluster with no cloud load-balancer controller — Helm's `wait: true` then hangs indefinitely regardless of timeout length. Fixed by setting `service.type` to `NodePort` via a `set` block. (MetalLB, a real bare-metal load-balancer implementation, is a noted future improvement rather than something adopted mid-build.)
+
+## Notable incidents (worth understanding, not just listing)
+
+**Secure Boot rejecting the VirtualBox kernel module.** `vboxdrv` failed to load with "Key was rejected by service." Rather than disabling Secure Boot, a MOK (Machine Owner Key) was generated and enrolled, and the module signed against it — the correct real-world fix, since it keeps Secure Boot's protection intact instead of turning it off.
+
+**A cross-node networking bug traced through five layers.** After `istiod`'s memory was fixed, the Istio gateway pod remained stuck at `0/1 Ready` with "connection refused" on its health port. The investigation went: gateway logs (proxy can't reach `istiod`) → confirmed the `istiod` Service/Endpoint was healthy → raw node-to-node `ping` succeeded → `calico-node` on one worker was crash-looping (`BIRD not ready`) → its logs showed it failing to reach Calico's `Typha` aggregation layer → `Typha`'s own Endpoints object showed **two replicas reporting the identical IP**, `10.0.2.15` → traced to the true root cause: every VM's default VirtualBox NAT adapter reports the *same* address (`10.0.2.15`) by design, since each VM has its own isolated NAT segment, and `kubelet` was defaulting to advertising that shared/non-unique interface for host-networked pods instead of each node's real, unique `192.168.56.x` address. Fixed by explicitly setting `--node-ip` in `kubeadm-flags.env` on all 3 nodes and restarting `kubelet`. Confirmed durable across a full VM restart.
+
+**An unclean VM shutdown silently corrupted multiple independent pieces of node state** (the `kubeadm`/`kubelet`/`kubectl` binaries, the Kubernetes apt repository file, the containerd systemd unit, containerd's `SystemdCgroup` config, and the `ip_forward` sysctl setting) — all traced back to VMs being left in VirtualBox's "aborted" state rather than cleanly halted. Each was diagnosed and repaired individually; the practical fix going forward is always running `vagrant halt` before letting the host machine sleep or shut down.
+
+## Repository layout
+
+- `api-gateway`, `order-service`, `inventory-service`, `notification-service` — one repo per microservice.
+- `platform-infra` — Vagrantfile, Ansible playbooks, Terraform configuration for the platform layer. This document lives here.
+- `gitops-manifests` *(planned)* — Kubernetes manifests/Helm values for the 4 services, watched by ArgoCD. Deliberately separate from the app repos themselves — application source and deployment configuration are different concerns with different change cadences, which is the actual GitOps pattern, not a simplification of it.
+
+## Current status
+
+Done: application scaffolding, VM base, Ansible provisioning, kubeadm cluster + Calico, Terraform-managed namespaces/RBAC, Istio, full Prometheus/Grafana/Loki observability stack.
+
+Next: ArgoCD, `gitops-manifests` wiring, the three CI/CD pipelines, Artifactory, then the security thread.

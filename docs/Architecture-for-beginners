@@ -1,0 +1,57 @@
+# What is this project? (A plain-English guide)
+
+If you don't know what Kubernetes, Terraform, or Istio are — this file is for you. No jargon without an explanation first. We'll use one running metaphor the whole way through: **think of this project as building a small, self-running city.**
+
+## The big picture, in one sentence
+
+We built a system where, someday soon, a developer will be able to write some code, push it, and — with nobody touching anything by hand — that code gets tested, packaged, checked for safety, and put live on real servers, while a dashboard quietly watches to make sure nothing's on fire. That whole self-driving pipeline is called a **platform**, and building your own from scratch (instead of paying a cloud company to give you one) is genuinely rare for one person to do.
+
+## The city metaphor
+
+Imagine a small city being built from nothing:
+
+- **The apps we're running (`api-gateway`, `order-service`, `inventory-service`, `notification-service`) are the shops in the city** — a storefront that takes orders, a warehouse that checks if something's in stock, a delivery office that sends out notifications. They're small, simple shops, not skyscrapers — because the point of this project isn't the shops themselves, it's everything around them that makes the city actually work.
+
+- **The 3 computers our city sits on (the VMs) are the plots of land.** We didn't buy land from a cloud company (like Amazon) — we carved 3 virtual plots out of one laptop instead, using free tools (Vagrant and VirtualBox) that let one real computer pretend to be several separate ones.
+
+- **Ansible is the construction crew that shows up to every plot of land and installs the exact same utilities** — water, power, gas — before any building can go up. It's automated: you don't manually wire each building, you tell the crew "do this everywhere" once, and it does.
+
+- **Kubernetes is the city's actual infrastructure system** — roads, addresses, zoning. It's the thing that knows "this shop lives at this address, and if it ever crashes or the building falls down, automatically put up a new one in its place." Without Kubernetes, you'd have shops sitting on empty land with no roads connecting them.
+
+- **Terraform is the city planning department.** It's the paperwork system that says "this district is zoned for shops" (namespaces), "only certain trucks are allowed to deliver to certain districts" (permissions/RBAC), and "here's where the traffic police station goes" (installing Istio). Terraform doesn't run the shops — it sets up the city's rules and structures ahead of time.
+
+- **Istio is the city's traffic and postal system.** Every truck moving between shops goes through it — it makes sure delivery trucks are who they say they are (this is called "mTLS," basically a tamper-proof ID card for every delivery), and it can reroute traffic on the fly (send 10% of orders to a "test version" of a shop to see if it works before switching everyone over).
+
+- **Prometheus and Grafana are the city's health inspectors and dashboard.** Every few seconds, they check each shop's pulse — how busy is it, is anything breaking — and put it all on a big screen so a human can glance at it and know instantly if something's wrong.
+
+- **Loki is the city's diary.** Instead of numbers (like Prometheus), it keeps the actual written record of everything each shop said out loud — useful when something breaks and you need to read exactly what happened, word for word, not just see a number spike.
+
+- **ArgoCD (coming soon) is the city's autopilot delivery system.** Right now, if you want to update a shop, someone has to walk over and do it. ArgoCD's whole job is: watch a specific instruction book (a Git repository), and the moment that book changes, automatically go make the city match it — no human walking over required.
+
+- **The CI/CD tools (GitHub Actions, Jenkins, GitLab CI) are three different quality-control inspectors, each checking something different** — one does a quick spot-check the moment new code shows up, one does a much more thorough inspection before anything ships, and one specifically checks the city-planning paperwork (the Terraform code) rather than the shops themselves. We didn't hire three inspectors to do the same job three times — that would just be slow and pointless. Each one checks something the others don't.
+
+- **The security tools we're adding later (Cosign, Kyverno, and friends) are the city's security guards and ID-checking system.** Cosign puts a tamper-proof seal on every package before it ships. Kyverno is the guard at the city gate who simply refuses to let in any package that isn't sealed. Without the guard, the seal is just decoration — nobody's actually checking it.
+
+## A story: what happens when someone places an order
+
+Let's walk through what happens right now (today) when the sample app processes an order, since it's the easiest way to see the pieces working together:
+
+1. A request comes in to `api-gateway` — the only shop with a front door facing the outside world.
+2. It walks the request over to `order-service`.
+3. `order-service` calls `inventory-service` and asks "do we have this in stock?" If yes, it reserves it. If not, the order fails cleanly with a clear reason — we deliberately built one item to always be out of stock, just so we'd have a real failure to test.
+4. If the stock reservation worked, `order-service` records the order, then makes a best-effort call to `notification-service` to say "hey, tell the customer." If that notification call fails for some reason, the order still succeeds — a failed notification isn't worth cancelling someone's order over.
+5. Every one of those calls between shops happens over the traffic system (once Istio is fully wired to the app), gets counted by the health inspectors (Prometheus), and gets written down word-for-word in the diary (Loki).
+
+## Why build it this way instead of just using a cloud provider?
+
+Two honest reasons. First, doing it the hard way — on your own hardware, dealing with real networking quirks a cloud provider normally hides from you — teaches you far more than clicking "deploy" on a managed service ever would. Second, this project is specifically meant to show depth in one area (how services are kept safe and verified before they ship) layered on top of broad, real infrastructure skill — not just "knows a checklist of buzzwords."
+
+## What's actually built right now vs. what's still coming
+
+**Already working:** the 4 shops, the 3-plot city, the construction crew, the roads (Kubernetes), the city planning department's zoning and traffic system (Terraform + Istio), and the health dashboard + diary (Prometheus/Grafana/Loki).
+
+**Coming next:** the autopilot delivery system (ArgoCD), the three quality inspectors (CI/CD), a proper city warehouse for packages (Artifactory), and the security guards at the gate.
+
+## A few honest bumps along the way (and why they're a good sign, not a bad one)
+
+Real infrastructure breaks in ways tutorials never show you. This project hit a few genuinely tricky ones — a security feature on the laptop initially refused to let the virtual "land" software run at all, and a deep, five-layer networking mystery took an entire session to trace down to one mismatched address setting. Every one of these got diagnosed and fixed properly, not worked around. That's not a sign the project went badly — figuring out *why* something broke, layer by layer, until you find the real cause, is a big part of what makes this kind of work valuable in the first place.
